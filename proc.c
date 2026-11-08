@@ -6,6 +6,7 @@
 #include "x86.h"
 #include "proc.h"
 #include "spinlock.h"
+#include "taint.h"
 
 struct {
   struct spinlock lock;
@@ -88,6 +89,7 @@ allocproc(void)
 found:
   p->state = EMBRYO;
   p->pid = nextpid++;
+  p->tainted = TAINT_NONE;
 
   release(&ptable.lock);
 

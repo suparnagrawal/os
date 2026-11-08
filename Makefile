@@ -183,6 +183,7 @@ UPROGS=\
 	_zombie\
 	_mytest\
 	_hello_test\
+	_taint_basic\
 	_agent_worker\
 
 fs.img: mkfs README $(UPROGS)

@@ -75,6 +75,7 @@ main(int argc, char *argv[])
 
 
   static_assert(sizeof(int) == 4, "Integers must be 4 bytes!");
+  static_assert(sizeof(struct dinode) == 64, "On-disk inode must be 64 bytes!");
 
   if(argc < 2){
     fprintf(stderr, "Usage: mkfs fs.img files...\n");

@@ -96,3 +96,9 @@ sys_hello(void)
     cprintf("Hello, World!\n"); //writes to xv6 console from kernel space // cprintf since we are inside the kernel
     return 0;
 }
+
+int
+sys_istainted(void)
+{
+  return myproc()->tainted;
+}

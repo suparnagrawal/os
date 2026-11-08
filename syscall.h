@@ -21,4 +21,6 @@
 #define SYS_mkdir  20
 #define SYS_close  21
 #define SYS_hello  22
+#define SYS_marktaint 23
+#define SYS_istainted 24
  

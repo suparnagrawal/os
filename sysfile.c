@@ -15,6 +15,7 @@
 #include "sleeplock.h"
 #include "file.h"
 #include "fcntl.h"
+#include "taint.h"
 
 // Fetch the nth word-sized system call argument as a file descriptor
 // and return both the descriptor and the corresponding struct file.
@@ -50,6 +51,35 @@ fdalloc(struct file *f)
     }
   }
   return -1;
+}
+
+// Mark a regular file as an untrusted taint source.
+int
+sys_marktaint(void)
+{
+  char *path;
+  struct inode *ip;
+
+  if(argstr(0, &path) < 0)
+    return -1;
+
+  begin_op();
+  if((ip = namei(path)) == 0){
+    end_op();
+    return -1;
+  }
+
+  ilock(ip);
+  if(ip->type != T_FILE){
+    iunlockput(ip);
+    end_op();
+    return -1;
+  }
+  ip->untrusted = TAINT_UNTRUSTED;
+  iupdate(ip);
+  iunlockput(ip);
+  end_op();
+  return 0;
 }
 
 int

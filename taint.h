@@ -1,0 +1,2 @@
+#define TAINT_NONE 0
+#define TAINT_UNTRUSTED 1
