@@ -81,7 +81,7 @@ argstr(int n, char **pp)
     return -1;
   return fetchstr(addr, pp);
 }
-extern int sys_hello(void);
+
 extern int sys_chdir(void);
 extern int sys_close(void);
 extern int sys_dup(void);
@@ -103,7 +103,7 @@ extern int sys_unlink(void);
 extern int sys_wait(void);
 extern int sys_write(void);
 extern int sys_uptime(void);
-extern int sys_add(void);
+extern int sys_hello(void);
 
 static int (*syscalls[])(void) = {
 [SYS_fork]    sys_fork,
@@ -127,8 +127,7 @@ static int (*syscalls[])(void) = {
 [SYS_link]    sys_link,
 [SYS_mkdir]   sys_mkdir,
 [SYS_close]   sys_close,
-[SYS_hello]   sys_hello,
-[SYS_add]     sys_add,
+[SYS_hello]   sys_hello
 };
 
 void

@@ -93,20 +93,6 @@ sys_uptime(void)
 int
 sys_hello(void)
 {
-    cprintf("hello from kernel by priyam\n");
+    cprintf("Hello, World!\n"); //writes to xv6 console from kernel space // cprintf since we are inside the kernel
     return 0;
-}
-
-int
-sys_add(void)
-{
-    int a, b;
-
-    if(argint(0, &a) < 0)
-        return -1;
-
-    if(argint(1, &b) < 0)
-        return -1;
-
-    return a + b;
 }

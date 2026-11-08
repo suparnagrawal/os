@@ -1,0 +1,3 @@
+The server handled 100 requests.
+Five requests failed.
+Average response time was 20 ms.
