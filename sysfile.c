@@ -222,6 +222,11 @@ sys_unlink(void)
   if(argstr(0, &path) < 0)
     return -1;
 
+  if(myproc()->tainted == TAINT_UNTRUSTED){
+    cprintf("unlink: refused tainted unlink of %s\n", path);
+    return -1;
+  }
+
   begin_op();
   if((dp = nameiparent(path, name)) == 0){
     end_op();
@@ -294,6 +299,8 @@ create(char *path, short type, short major, short minor)
   ip->major = major;
   ip->minor = minor;
   ip->nlink = 1;
+  if(type == T_FILE && myproc()->tainted == TAINT_UNTRUSTED)
+    ip->untrusted = TAINT_UNTRUSTED;
   iupdate(ip);
 
   if(type == T_DIR){  // Create . and .. entries.

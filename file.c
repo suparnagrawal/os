@@ -9,6 +9,10 @@
 #include "spinlock.h"
 #include "sleeplock.h"
 #include "file.h"
+#include "mmu.h"
+#include "proc.h"
+#include "stat.h"
+#include "taint.h"
 
 struct devsw devsw[NDEV];
 struct {
@@ -106,6 +110,8 @@ fileread(struct file *f, char *addr, int n)
     ilock(f->ip);
     if((r = readi(f->ip, addr, f->off, n)) > 0)
       f->off += r;
+    if(r > 0 && f->ip->type == T_FILE && f->ip->untrusted == TAINT_UNTRUSTED)
+      myproc()->tainted = TAINT_UNTRUSTED;
     iunlock(f->ip);
     return r;
   }
@@ -124,6 +130,14 @@ filewrite(struct file *f, char *addr, int n)
   if(f->type == FD_PIPE)
     return pipewrite(f->pipe, addr, n);
   if(f->type == FD_INODE){
+    ilock(f->ip);
+    if(myproc()->tainted == TAINT_UNTRUSTED && f->ip->type == T_FILE && f->ip->untrusted != TAINT_UNTRUSTED){
+      iunlock(f->ip);
+      cprintf("filewrite: refused tainted write to clean file\n");
+      return -1;
+    }
+    iunlock(f->ip);
+
     // write a few blocks at a time to avoid exceeding
     // the maximum log transaction size, including
     // i-node, indirect block, allocation blocks,

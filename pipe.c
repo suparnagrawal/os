@@ -7,6 +7,7 @@
 #include "spinlock.h"
 #include "sleeplock.h"
 #include "file.h"
+#include "taint.h"
 
 #define PIPESIZE 512
 
@@ -17,6 +18,7 @@ struct pipe {
   uint nwrite;    // number of bytes written
   int readopen;   // read fd is still open
   int writeopen;  // write fd is still open
+  int tainted;    // data written by tainted process
 };
 
 int
@@ -34,6 +36,7 @@ pipealloc(struct file **f0, struct file **f1)
   p->writeopen = 1;
   p->nwrite = 0;
   p->nread = 0;
+  p->tainted = 0;
   initlock(&p->lock, "pipe");
   (*f0)->type = FD_PIPE;
   (*f0)->readable = 1;
@@ -91,6 +94,8 @@ pipewrite(struct pipe *p, char *addr, int n)
       sleep(&p->nwrite, &p->lock);  //DOC: pipewrite-sleep
     }
     p->data[p->nwrite++ % PIPESIZE] = addr[i];
+    if(myproc()->tainted == TAINT_UNTRUSTED)
+      p->tainted = 1;
   }
   wakeup(&p->nread);  //DOC: pipewrite-wakeup1
   release(&p->lock);
@@ -115,6 +120,8 @@ piperead(struct pipe *p, char *addr, int n)
       break;
     addr[i] = p->data[p->nread++ % PIPESIZE];
   }
+  if(p->tainted && i > 0)
+    myproc()->tainted = TAINT_UNTRUSTED;
   wakeup(&p->nwrite);  //DOC: piperead-wakeup
   release(&p->lock);
   return i;

@@ -184,6 +184,9 @@ UPROGS=\
 	_mytest\
 	_hello_test\
 	_taint_basic\
+	_taint_pipe\
+	_taint_policy\
+	_taint_launder\
 	_agent_worker\
 
 fs.img: mkfs README $(UPROGS)

@@ -6,6 +6,7 @@
 #include "defs.h"
 #include "x86.h"
 #include "elf.h"
+#include "taint.h"
 
 int
 exec(char *path, char **argv)
@@ -18,6 +19,13 @@ exec(char *path, char **argv)
   struct proghdr ph;
   pde_t *pgdir, *oldpgdir;
   struct proc *curproc = myproc();
+
+  if(curproc->tainted == TAINT_UNTRUSTED){
+    if(strncmp(path, "/safe/", 6) != 0){
+      cprintf("exec: refused tainted exec of %s\n", path);
+      return -1;
+    }
+  }
 
   begin_op();
 
