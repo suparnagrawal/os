@@ -1,0 +1,4 @@
+This file is clean and trusted.
+A tainted process should not be allowed to write here.
+If you can read this unmodified message, the kernel policy is working correctly.
+

@@ -196,8 +196,8 @@ fs.img: mkfs README $(UPROGS)
 	./mkfs fs.img README $(UPROGS)
 
 # Separate disk for the agent demo; leave the existing guest's fs.img alone.
-agent-fs.img: mkfs README report.txt $(UPROGS)
-	./mkfs agent-fs.img README report.txt $(UPROGS)
+agent-fs.img: mkfs README report.txt inbox.txt clean.txt $(UPROGS)
+	./mkfs agent-fs.img README report.txt inbox.txt clean.txt $(UPROGS)
 
 -include *.d
 

@@ -4,9 +4,14 @@
 #include "user.h"
 #include "fs.h"
 #include "fcntl.h"
+#include "taint.h"
 
 #define MAX_LINE 120
 #define MAX_OUTPUT 4096
+
+// Fixed message written by WRITE to avoid model-controlled content.
+#define WRITE_MSG "agent-write-test\n"
+#define WRITE_MSG_LEN 17
 
 static void
 finish(char *status)
@@ -103,12 +108,51 @@ handle_request(char *line)
   struct stat st;
   int fd;
 
+  // STATUS has no path argument — handle it first.
+  if(strcmp(line, "STATUS") == 0){
+    printf(1, "@XV6 TAINT %d\n", istainted());
+    return;
+  }
+
   path = strchr(line, ' ');
   if(path == 0){
     finish("ERROR invalid_request");
     return;
   }
   *path++ = 0;
+
+  // TAINT: mark a file as an untrusted taint source.
+  if(strcmp(line, "TAINT") == 0){
+    if(!valid_path(path)){
+      finish("ERROR invalid_request");
+      return;
+    }
+    if(marktaint(path) < 0)
+      finish("ERROR marktaint_failed");
+    else
+      finish("OK");
+    return;
+  }
+
+  // WRITE: open an existing file and write a fixed test message.
+  if(strcmp(line, "WRITE") == 0){
+    if(!valid_path(path)){
+      finish("ERROR invalid_request");
+      return;
+    }
+    fd = open(path, O_RDWR);
+    if(fd < 0){
+      finish("ERROR open_failed");
+      return;
+    }
+    int n = write(fd, WRITE_MSG, WRITE_MSG_LEN);
+    close(fd);
+    if(n < 0)
+      finish("ERROR write_blocked");
+    else
+      finish("OK");
+    return;
+  }
 
   if(!valid_path(path)){
     finish("ERROR invalid_request");

@@ -11,27 +11,42 @@ import time
 
 
 ROOT = Path(__file__).resolve().parent.parent
-OPERATIONS = {"list_files": "LIST", "read_file": "READ"}
+
+# Operations that require exactly one absolute path argument.
+PATH_OPERATIONS = {"list_files": "LIST", "read_file": "READ", "mark_file": "TAINT", "try_write": "WRITE"}
+# Operations that require no arguments.
+NO_ARG_OPERATIONS = {"taint_status": "STATUS"}
+OPERATIONS = {**PATH_OPERATIONS, **NO_ARG_OPERATIONS}
 
 
 class BridgeError(RuntimeError):
     pass
 
 
-def validate_action(name, args):
-    """Accept only our two tools and simple absolute xv6 paths."""
-    if name not in OPERATIONS:
-        raise ValueError("Unknown tool. Use list_files or read_file.")
-    if not isinstance(args, dict) or set(args) != {"path"}:
-        raise ValueError("The tool requires exactly one argument: path.")
-
-    path = args["path"]
+def _validate_path(path):
+    """Validate a simple absolute xv6 path. Raises ValueError on failure."""
     if not isinstance(path, str) or not re.fullmatch(r"/[A-Za-z0-9_./-]{0,79}", path):
         raise ValueError("Use an absolute xv6 path with simple characters.")
     parts = path[1:].split("/") if path != "/" else []
     if any(not part or part in (".", "..") or len(part) > 14 for part in parts):
         raise ValueError("Each path component must be 1-14 characters; . and .. are not allowed.")
     return path
+
+
+def validate_action(name, args):
+    """Accept only declared tools and validate their arguments."""
+    if name not in OPERATIONS:
+        raise ValueError(f"Unknown tool '{name}'. Use: {', '.join(sorted(OPERATIONS))}.")
+
+    if name in NO_ARG_OPERATIONS:
+        if args:
+            raise ValueError(f"'{name}' takes no arguments.")
+        return None
+
+    # Path operations: exactly one argument named "path".
+    if not isinstance(args, dict) or set(args) != {"path"}:
+        raise ValueError("The tool requires exactly one argument: path.")
+    return _validate_path(args["path"])
 
 
 def build_images(root=ROOT):
@@ -137,11 +152,19 @@ class QemuBridge:
 
     def execute(self, name, args):
         path = validate_action(name, args)
-        request = f"{OPERATIONS[name]} {path}".encode()
-        content = bytearray()
 
+        # Build the protocol request line.
+        op = OPERATIONS[name]
+        if path is None:
+            # No-argument operation (e.g. STATUS).
+            request = op.encode()
+        else:
+            request = f"{op} {path}".encode()
+
+        content = bytearray()
         self._send(request + b"\n")
         deadline = time.monotonic() + 10
+
         while True:
             line = self._readline(deadline)
             if not line or line == request:  # xv6 echoes console input
@@ -150,14 +173,31 @@ class QemuBridge:
                 raise BridgeError("Unexpected response from xv6.")
 
             message = line[len(b"@XV6 "):]
+
+            # STATUS response: "@XV6 TAINT 0" or "@XV6 TAINT 1"
+            if message.startswith(b"TAINT "):
+                val = message[6:].strip()
+                tainted = val == b"1"
+                return {"ok": True, "tainted": tainted}
+
             if message.startswith(b"DATA "):
                 try:
                     content.extend(bytes.fromhex(message[5:].decode()))
                 except ValueError as exc:
                     raise BridgeError("Invalid data from xv6.") from exc
             elif message.startswith(b"DONE ERROR "):
-                return {"ok": False, "path": path, "error": message[11:].decode()}
+                error = message[11:].decode()
+                result = {"ok": False, "error": error}
+                if path:
+                    result["path"] = path
+                return result
             elif message in (b"DONE OK", b"DONE TRUNCATED"):
+                if not content:
+                    # Operation with no data payload (TAINT, WRITE).
+                    result = {"ok": True}
+                    if path:
+                        result["path"] = path
+                    return result
                 try:
                     text = content.decode("utf-8")
                 except UnicodeDecodeError:

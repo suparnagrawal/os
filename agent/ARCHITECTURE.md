@@ -2,59 +2,51 @@
 
 ## 1. What we have built
 
-We built a small host-side AI agent that can inspect files inside an xv6 guest.
-You type a normal-language instruction such as:
+We built a small host-side AI agent that can inspect files inside an xv6 guest
+and demonstrate kernel-enforced taint tracking.
 
-```text
-Read /report.txt and summarize it.
-```
+**Available tools:**
 
-Gemini does not directly open the file. It proposes a structured tool call:
+| Tool | Arguments | Description |
+|---|---|---|
+| `list_files(path)` | absolute path | List names in an xv6 directory |
+| `read_file(path)` | absolute path | Read an xv6 text file (up to 4096 bytes) |
+| `mark_file(path)` | absolute path | Mark a regular file as untrusted (a taint source) |
+| `taint_status()` | — | Return whether the persistent worker is tainted |
+| `try_write(path)` | absolute path | Attempt to write a fixed message to an existing file |
+
+Gemini does not directly open files. It proposes a structured tool call:
 
 ```json
 {
-  "tool": "read_file",
-  "args": {"path": "/report.txt"}
+  "tool": "mark_file",
+  "args": {"path": "/inbox.txt"}
 }
 ```
 
-Our Python program validates the call, sends a simple request through QEMU's
-serial console, and an xv6 user program reads the file using existing xv6
-system calls. The result travels back to Python and then to Gemini, which writes
-the final answer.
-
-This milestone is read-only. It supports:
-
-- `list_files(path)` — list the names in an xv6 directory.
-- `read_file(path)` — read an xv6 text file, up to 4096 bytes.
-
-We have not implemented taint tracking or kernel protection yet. Those are the
-next project stage. The current pipeline gives us the path through which we can
-later demonstrate those kernel policies.
+Our Python program validates the call, sends a request through QEMU's serial
+console, and the xv6 worker executes the appropriate system calls. The result
+returns to Python and then to Gemini.
 
 ## 2. Which part runs where?
-
-There are two separate computers from the software's point of view:
 
 | Location | What runs there | Responsibility |
 |---|---|---|
 | Ubuntu host | Terminal, Python agent, Gemini SDK, QEMU process | Accept the user's request, ask Gemini for a tool call, validate it, and communicate with QEMU. |
 | Google servers | Gemini model | Interpret the natural-language instruction, choose a declared tool, and later summarize the tool result. |
-| xv6 guest inside QEMU | xv6 kernel, xv6 shell, `agent_worker` | Execute the approved operation using xv6 system calls and return the actual guest result. |
+| xv6 guest inside QEMU | xv6 kernel (with taint enforcement), xv6 shell, `agent_worker` | Execute the approved operation using xv6 system calls and return the actual guest result. |
 
 QEMU is an ordinary Ubuntu process, but it emulates a complete x86 computer.
-Inside that emulated computer, xv6 boots as the operating system. xv6 has its
-own kernel, processes, filesystem, and paths. Therefore `/report.txt` means a
-file in the xv6 filesystem, not `/report.txt` on Ubuntu.
+Inside that emulated computer, xv6 boots as the operating system.
 
 ```mermaid
 flowchart LR
-    U[User terminal] --> P[Python agent<br/>Ubuntu host]
-    P -->|prompt + tool definitions| G[Gemini API<br/>Google servers]
+    U[User terminal] --> P[Python agent]
+    P -->|prompt + tool definitions| G[Gemini API]
     G -->|structured tool call| P
-    P -->|validated serial request| Q[QEMU<br/>host process]
-    Q --> W[agent_worker<br/>xv6 user process]
-    W -->|open / read / close| K[xv6 kernel]
+    P -->|validated serial request| Q[QEMU]
+    Q --> W[agent_worker]
+    W -->|syscalls| K[xv6 kernel + taint]
     K --> F[xv6 filesystem]
     F --> K --> W
     W -->|serial reply| Q --> P
@@ -62,21 +54,62 @@ flowchart LR
     G -->|final answer| P --> U
 ```
 
-## 3. The files and their roles
+## 3. Taint tracking design
+
+### Kernel data structures
+
+| Structure | Field | Meaning |
+|---|---|---|
+| `struct proc` | `int tainted` | Non-zero when the process has read untrusted data |
+| `struct inode` | `short untrusted` | In-memory untrusted flag (loaded from disk by `ilock`) |
+| `struct dinode` | `short untrusted` | On-disk persistence of the untrusted flag |
+| `struct pipe` | `int tainted` | Sticky flag: set when a tainted process writes to this pipe |
+
+`NDIRECT` was reduced from 12 to 11 so that `struct dinode` remains exactly
+64 bytes after adding the `short untrusted` field.
+
+### How taint spreads
+
+```
+marktaint("/inbox.txt")       → inode.untrusted = 1  (Priyam)
+read("/inbox.txt") >= 1 byte  → proc.tainted   = 1  (Abhishek)
+fork()                        → child.tainted  = 1  (Abhishek)
+exec() inside /safe/          → taint survives      (Abhishek)
+pipewrite() by tainted proc   → pipe.tainted   = 1  (Suparn)
+piperead()  from tainted pipe → proc.tainted   = 1  (Suparn)
+```
+
+### What the kernel enforces
+
+| Attempted operation | Condition | Result |
+|---|---|---|
+| `write` to existing clean file | proc is tainted | Returns `-1`, logs one line |
+| `unlink` any path | proc is tainted | Returns `-1`, logs one line |
+| `exec` path not under `/safe/` | proc is tainted | Returns `-1`, logs one line |
+| `create` new regular file | proc is tainted | New file marked untrusted automatically |
+| Write to console or pipe | any | Always allowed |
+
+### End-to-end taint demo flow
+
+```
+Step 1  mark_file("/inbox.txt")  → kernel: inode.untrusted = 1
+Step 2  read_file("/inbox.txt")  → kernel: proc.tainted    = 1
+Step 3  taint_status()           → @XV6 TAINT 1
+Step 4  try_write("/clean.txt")  → kernel: REFUSED (write_blocked)
+Step 5  read_file("/clean.txt")  → file unchanged, policy confirmed
+```
+
+## 4. The files and their roles
 
 ### `agent/main.py` — agent and terminal interface on Ubuntu
 
-This is the main host-side program. It performs five jobs:
+This is the main host-side program. It:
 
 1. Loads `GEMINI_API_KEY` and `GEMINI_MODEL` from the project-root `.env` file.
-2. Declares the two tools and their JSON argument schemas for Gemini.
+2. Declares all five tools and their JSON argument schemas for Gemini.
 3. Reads the user's instruction from the terminal.
 4. Runs the Gemini function-calling loop.
 5. Passes approved tool calls to `QemuBridge` and sends results back to Gemini.
-
-The declarations in `TOOLS` tell Gemini that the only available
-actions are `list_files` and `read_file`. A tool declaration describes an
-action; it does not execute that action.
 
 `SYSTEM_INSTRUCTION` tells Gemini to use actual tool results, treat file content
 as data, use absolute guest paths, and stay within five tool calls.
@@ -86,75 +119,48 @@ as data, use absolute guest paths, and stay within five tool calls.
 This module owns the QEMU process and converts a Python tool call into the
 small text protocol understood by `agent_worker`.
 
-It:
-
-- builds `xv6.img` and `agent-fs.img`;
-- starts QEMU without a graphical window;
-- waits for the xv6 shell prompt;
-- starts `agent_worker` inside xv6;
-- validates every tool name and path;
-- writes requests to QEMU's standard input;
-- reads replies from QEMU's standard output;
-- checks replies, errors, timeouts, and output limits; and
-- stops QEMU and removes its temporary disk copies when the session ends.
-
-The bridge contains the mapping:
-
 ```python
-OPERATIONS = {
-    "list_files": "LIST",
-    "read_file": "READ",
-}
+PATH_OPERATIONS  = {"list_files": "LIST", "read_file": "READ",
+                    "mark_file": "TAINT", "try_write": "WRITE"}
+NO_ARG_OPERATIONS = {"taint_status": "STATUS"}
 ```
 
 Gemini only sees the names on the left. The guest worker only sees the protocol
-operations on the right.
+operations on the right. `validate_action()` applies different schemas: path
+operations require exactly one valid absolute path; `taint_status` requires no
+arguments.
 
 ### `agent_worker.c` — persistent user process inside xv6
 
-The worker is compiled as an xv6 user program and placed in the guest
-filesystem as `agent_worker`. It starts inside xv6, prints a ready message, and
-then waits for line-based requests on standard input.
+The worker handles five protocol operations:
 
-For a read request it calls:
+| Request | xv6 syscalls used |
+|---|---|
+| `LIST <path>` | `open`, `fstat`, `read` (dirents), `close` |
+| `READ <path>` | `open`, `fstat`, `read`, `close` |
+| `TAINT <path>` | `marktaint(path)` (syscall 23) |
+| `STATUS` | `istainted()` (syscall 24) → `@XV6 TAINT 0` or `1` |
+| `WRITE <path>` | `open(O_RDWR)`, `write` (fixed message), `close` |
 
-```text
-open(path, O_RDONLY) → fstat(fd, ...) → read(fd, ...) → close(fd)
-```
-
-For a directory listing it opens the directory and reads its `struct dirent`
-entries. These are normal existing xv6 system calls. We did not add a new
-`read_file` system call to the kernel.
-
-Keeping one worker alive for the entire agent session matters for the later
-project. When reading an untrusted file eventually taints this process, later
-operations will still be performed by the same process and the kernel can
-continue enforcing restrictions on it.
+The worker stays alive for the entire agent session. When it reads an untrusted
+file, it becomes tainted and all subsequent kernel operations from that process
+are subject to the taint policy.
 
 ### `Makefile`, images, and sample data
 
-The Makefile adds `_agent_worker` to `UPROGS`, so `mkfs` packages the worker into
-the xv6 filesystem. It also defines a separate `agent-fs.img` containing the
-sample `report.txt`.
+- `xv6.img` — bootable xv6 kernel image.
+- `agent-fs.img` — xv6 filesystem for the demo, containing:
+  - `report.txt` — sample file for Milestone 1 read demo.
+  - `inbox.txt` — file marked untrusted by the taint demo.
+  - `clean.txt` — file that should survive a blocked write attempt.
+  - all compiled xv6 user programs.
+- The bridge copies both images into a temporary directory before starting QEMU.
 
-- `xv6.img` contains the bootable xv6 kernel image.
-- `agent-fs.img` contains the xv6 filesystem used by this demonstration.
-- `report.txt` on the host is copied into `agent-fs.img` at build time and
-  appears as `/report.txt` inside xv6.
-
-The bridge copies both images into a temporary directory before starting QEMU.
-This avoids modifying the original images and avoids conflicts with another
-QEMU instance that may already be open.
-
-## 4. Startup sequence
-
-Run the live agent from the repository root:
+## 5. Startup sequence
 
 ```bash
 .venv/bin/python -m agent.main
 ```
-
-The following startup steps happen:
 
 1. `main.py` reads `.env` and creates a Gemini client.
 2. `build_images()` runs `make xv6.img agent-fs.img`.
@@ -163,158 +169,28 @@ The following startup steps happen:
 5. QEMU emulates the x86 hardware and boots the xv6 kernel from `xv6.img`.
 6. xv6 mounts the filesystem from `agent-fs.img` and starts its shell.
 7. Python watches QEMU's serial output until it sees the xv6 `$ ` prompt.
-8. Python writes `agent_worker\n` to the serial console, just as if someone
-   typed the command at the xv6 shell.
-9. The xv6 shell creates the `agent_worker` process.
-10. The worker prints `@XV6 READY <pid>` and waits for requests.
+8. Python writes `agent_worker\n` to the serial console.
+9. The worker prints `@XV6 READY <pid>` and waits for requests.
 
-At this point the host agent and guest worker are connected and ready.
-
-## 5. One complete `read_file` request
-
-Suppose the user enters:
+## 6. Serial protocol
 
 ```text
-Read /report.txt and summarize it.
+Python → xv6:  LIST /
+Python → xv6:  READ /inbox.txt
+Python → xv6:  TAINT /inbox.txt
+Python → xv6:  STATUS
+Python → xv6:  WRITE /clean.txt
+
+xv6 → Python:  @XV6 DATA <hex-encoded-bytes>   (zero or more)
+xv6 → Python:  @XV6 DONE OK
+xv6 → Python:  @XV6 DONE TRUNCATED
+xv6 → Python:  @XV6 DONE ERROR <reason>
+xv6 → Python:  @XV6 TAINT 0                    (STATUS response only)
+xv6 → Python:  @XV6 TAINT 1
 ```
 
-### Step 1: Python sends the prompt and tool descriptions to Gemini
-
-`GeminiAgent.run()` creates a Gemini request containing:
-
-- the user's instruction;
-- the system instruction;
-- the `list_files` and `read_file` declarations; and
-- the rule that our code, rather than the SDK, executes function calls.
-
-Gemini receives descriptions of tools, not direct access to Python, QEMU, the
-host shell, or xv6.
-
-### Step 2: Gemini proposes a structured tool call
-
-Gemini may return a function call equivalent to:
-
-```json
-{
-  "name": "read_file",
-  "args": {"path": "/report.txt"}
-}
-```
-
-This is still only data. Nothing has been executed yet.
-
-### Step 3: Python validates and dispatches the call
-
-`execute_tool()` calls `bridge.execute()`. `validate_action()` checks that:
-
-- the tool is exactly `read_file` or `list_files`;
-- the only argument is `path`;
-- the path is absolute;
-- its length and characters are permitted;
-- no path component is empty, `.` or `..`; and
-- each component fits xv6's 14-character filename limit.
-
-Python never converts Gemini text into a host shell command. After validation,
-the bridge maps `read_file` to `READ` and creates:
-
-```text
-READ /report.txt
-```
-
-### Step 4: The request reaches xv6 through QEMU serial I/O
-
-QEMU was started with `-serial stdio`. This connects the emulated machine's
-serial console to the Python QEMU process's standard input and output:
-
-```text
-Python process stdin pipe  →  QEMU serial input  →  xv6 console input
-xv6 console output         →  QEMU serial output → Python process stdout pipe
-```
-
-The worker is already reading file descriptor `0`, so it receives the request
-line. QEMU does not understand the tool or read the file; it only carries bytes
-between Python and the emulated machine.
-
-### Step 5: The worker invokes xv6 system calls
-
-`agent_worker` parses the request again, validates the path again, and calls
-`open`, `fstat`, `read`, and `close`.
-
-These C library stubs enter the xv6 kernel through the normal system-call path.
-The kernel checks the descriptor and inode, reads filesystem blocks from the
-guest disk, and copies the data back into the worker's user-space buffer.
-
-This distinction is central:
-
-| Level | Example | Meaning |
-|---|---|---|
-| Gemini tool call | `read_file({"path":"/report.txt"})` | A structured request proposed by the model. |
-| Bridge protocol | `READ /report.txt` | Bytes sent from host Python to the persistent guest worker. |
-| xv6 system calls | `open`, `fstat`, `read`, `close` | Controlled entries from the xv6 user program into the xv6 kernel. |
-
-### Step 6: The worker returns a framed response
-
-The worker sends file bytes in hexadecimal DATA messages:
-
-```text
-@XV6 DATA 546865207365727665722068616e646c6564...
-@XV6 DONE OK
-```
-
-There may be several DATA lines. Hex encoding prevents a line inside a file
-from looking like a protocol control message. Requests run one at a time, so
-the next completion belongs to the current request.
-
-Possible completions include:
-
-```text
-@XV6 DONE OK
-@XV6 DONE TRUNCATED
-@XV6 DONE ERROR open_failed
-```
-
-### Step 7: Python reconstructs the tool result
-
-The bridge reads complete lines even if QEMU returns output in smaller chunks.
-It verifies the reply format, decodes the hexadecimal bytes as UTF-8, and returns
-a Python dictionary such as:
-
-```json
-{
-  "ok": true,
-  "path": "/report.txt",
-  "content": "The server handled 100 requests.\nFive requests failed.\nAverage response time was 20 ms.\n",
-  "truncated": false
-}
-```
-
-### Step 8: The result goes back to Gemini
-
-`main.py` sends that dictionary as the response to Gemini's original function
-call. Gemini now has actual file contents and can produce a grounded answer,
-for example:
-
-```text
-The server handled 100 requests, with five failures (5%), and had an average
-response time of 20 ms.
-```
-
-The answer is printed in the Ubuntu terminal. The complete round trip is now
-finished.
-
-## 6. How commands are issued
-
-The word “command” can mean three things here:
-
-1. **User instruction:** natural language typed into the Ubuntu terminal.
-2. **Tool call:** structured `list_files` or `read_file` data proposed by Gemini.
-3. **Guest protocol request:** a validated `LIST` or `READ` line sent to the
-   already-running xv6 worker.
-
-The model cannot issue arbitrary xv6 or Ubuntu shell commands. It can only
-request the two declared tools. The Python validator rejects unknown tools and
-malformed paths before anything reaches QEMU. The guest worker also supports
-only `LIST` and `READ`.
+Hex encoding prevents file text from being confused with protocol control
+messages. Requests run one at a time.
 
 ## 7. Available running modes
 
@@ -325,8 +201,7 @@ only `LIST` and `READ`.
 ```
 
 Natural language goes to Gemini. Gemini chooses tools, receives xv6 results,
-and writes the final answer. This mode needs a valid `.env`, internet access,
-and Gemini quota.
+and writes the final answer. Needs a valid `.env`, internet access, and quota.
 
 ### Scripted interactive mode
 
@@ -334,59 +209,62 @@ and Gemini quota.
 python3 -m agent.main --scripted
 ```
 
-Use commands such as `list /` and `read /report.txt`. This bypasses Gemini but
-uses the same validator, bridge, QEMU instance, worker, xv6 system calls, and
-response protocol.
+Supported commands:
 
-### Repeatable demonstration mode
+```text
+list [PATH]       list a directory (default: /)
+read PATH         read a file
+taint PATH        mark a file as untrusted
+status            check if the worker is tainted
+write PATH        attempt to write to an existing file
+exit / quit       stop
+```
+
+### Repeatable read-only demonstration
 
 ```bash
 python3 -m agent.main --demo
 ```
 
-This automatically lists `/`, reads `/report.txt`, and tries `/missing.txt`.
-It proves that the real Python → QEMU → xv6 → Python pipeline works even when a
-Gemini key or network connection is unavailable. It must be described as a
-scripted demonstration because no model is involved.
+Lists `/`, reads `/report.txt`, and tries `/missing.txt`.
+
+### Taint enforcement demonstration
+
+```bash
+python3 -m agent.main --taint-demo
+```
+
+Runs the five-step sequence without Gemini:
+
+1. Mark `/inbox.txt` as untrusted.
+2. Read `/inbox.txt` (worker becomes tainted).
+3. Query taint status (expect `tainted: true`).
+4. Attempt to write to `/clean.txt` (kernel blocks it).
+5. Read `/clean.txt` to confirm it is unchanged.
 
 ## 8. Important limits and error handling
 
-- Only two read-only tools are accepted.
-- At most five Gemini tool calls are allowed per user instruction.
-- A returned file or listing is limited to 4096 bytes.
-- Only text is supported; control characters and invalid UTF-8 are rejected.
+- Five Gemini tool calls are allowed per user instruction.
+- Files and listings are limited to 4096 bytes.
+- Only text (valid UTF-8) is returned; binary files produce `not_utf8_text`.
 - Guest operations time out after 10 seconds; boot waits up to 30 seconds.
-- Missing files return `open_failed`; the agent does not invent contents.
-- A malformed reply or transport failure closes the guest session because the
-  serial stream can no longer be trusted to be synchronized.
-- The Gemini SDK uses the API key to authenticate with Google's API. The bridge
-  removes Gemini key variables before starting QEMU, and no key is sent through
-  the serial protocol into xv6.
+- A malformed reply closes the guest session.
+- No API key is sent through the serial protocol into xv6.
+- Each QEMU session uses a temporary copy of the disk images, so the demo
+  always starts from a clean state.
 
-## 9. What is still to be implemented
+## 9. Security: host vs guest responsibilities
 
-This milestone proves that an agent can request an action, that the action can
-reach an xv6 process, and that the actual result can return to the model.
+The Python validator and Gemini tool declarations provide a first line of
+defence. The xv6 kernel is the final enforcement point. Even if a future model
+is tricked into proposing a dangerous tool call, the kernel will refuse it if
+the process is tainted.
 
-The security project will later extend xv6 so that:
-
-- a file can be marked untrusted;
-- reading it taints the persistent worker process;
-- taint propagates through fork, exec, pipes, and written files; and
-- the xv6 kernel refuses dangerous operations by tainted processes.
-
-The model and Python validator help keep requests controlled, but the kernel is
-the final enforcement point. Even if a future model is tricked into proposing a
-dangerous action, the goal is for the xv6 kernel to reject it.
-
-## 10. Short presentation explanation
-
-You can explain the demo as follows:
-
-> The Python agent runs on Ubuntu, while xv6 runs as a guest operating system
-> inside QEMU. Gemini only chooses between two structured tools. Python validates
-> the chosen tool and sends a small request through QEMU's serial console to a
-> persistent xv6 user program. That program uses ordinary xv6 system calls to
-> read the guest filesystem and sends the result back. Python gives the real
-> result to Gemini, and Gemini prepares the final answer. The current milestone
-> proves this end-to-end pipeline; kernel taint enforcement is the next stage.
+| Responsibility | Host (Python) | Guest (xv6 kernel) |
+|---|---|---|
+| Tool whitelist | validate_action | worker checks op string |
+| Path sanitisation | regex + component check | valid_path in worker |
+| Taint propagation | — | fileread, fork, exec, pipe |
+| Write policy | — | filewrite refuses clean file |
+| Unlink policy | — | sys_unlink refuses tainted proc |
+| Exec policy | — | exec checks /safe/ prefix |

@@ -1,0 +1,4 @@
+This file is marked untrusted by the agent demo.
+Reading it will taint the persistent worker process.
+Any attempt to write to a clean file after this will be blocked by the kernel.
+

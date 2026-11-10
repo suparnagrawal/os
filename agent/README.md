@@ -1,106 +1,124 @@
-# Gemini → QEMU → xv6
+# Gemini → QEMU → xv6 with Kernel Taint Enforcement
 
-This is a small teaching pipeline:
+This repository implements **kernel-enforced taint tracking** in xv6, integrated with a Gemini AI agent running over a QEMU serial pipeline.
 
 ```text
 User instruction
-  → Gemini chooses list_files or read_file
-  → Python validates the tool call
+  → Gemini chooses a tool (list_files, read_file, mark_file, taint_status, try_write)
+  → Python validates the tool call and arguments
   → QEMU serial console
-  → agent_worker inside xv6
-  → xv6 open/read system calls
+  → persistent agent_worker inside xv6
+  → xv6 kernel executes or enforces taint policy
   → result returns to Gemini
   → final answer
 ```
 
-The current milestone is read-only. Kernel taint tracking comes later.
+For the complete architectural design, see [ARCHITECTURE.md](ARCHITECTURE.md).  
+For viva preparation, design defenses, and test breakdowns, see [VIVA_GUIDE.md](VIVA_GUIDE.md).
 
-For the complete architecture explanation, see [ARCHITECTURE.md](ARCHITECTURE.md).
-For viva preparation and detailed code walkthrough, see
-[VIVA_GUIDE.md](VIVA_GUIDE.md).
+---
 
-## Run without Gemini
+## What We Built
 
-This proves that Python can reach the real xv6 guest:
+1. **Kernel Taint Subsystem:**
+   - On-disk persistent inode taint marking (`short untrusted` in `struct dinode` with `NDIRECT 11`, keeping size at 64 bytes).
+   - System calls: `marktaint(path)` (23) and `istainted()` (24).
+   - Dynamic taint propagation across file reads, process `fork()`, `exec()`, and IPC pipes.
+   - Kernel policy enforcement:
+     - Tainted processes **cannot** write to clean files (write-down blocked).
+     - Tainted processes **cannot** call `unlink()`.
+     - Tainted processes **can only** execute binaries located under `/safe/`.
+     - Console writes and pipe writes remain permitted.
+2. **AI Agent Pipeline:**
+   - 5 structured Gemini tools: `list_files`, `read_file`, `mark_file`, `taint_status`, `try_write`.
+   - Host Python validator rejecting malformed paths and unpermitted operations.
+   - Persistent `agent_worker` communicating over serial with framed `@XV6` messages.
+
+---
+
+## Running the Demos
+
+### 1. Deterministic Taint Enforcement Demo (No Gemini needed)
+
+This runs a 5-step demonstration proving kernel enforcement:
+1. Marks `/inbox.txt` untrusted.
+2. Reads `/inbox.txt` (the worker becomes tainted).
+3. Queries taint status (verifies `tainted: true`).
+4. Attempts to write to `/clean.txt` (the xv6 kernel blocks the write).
+5. Reads `/clean.txt` to confirm its contents are pristine.
 
 ```bash
-python3 -m agent.main --demo
+python3 -m agent.main --taint-demo
 ```
 
-It lists `/`, reads `/report.txt`, and shows the error for `/missing.txt`.
+### 2. Scripted Interactive Mode
 
-You can also issue simple commands yourself:
+Issue manual commands using the same validated protocol:
 
 ```bash
 python3 -m agent.main --scripted
 ```
 
-Then enter `list /`, `read /report.txt`, or `exit`.
+Available commands:
+- `list [PATH]` — list directory (default: `/`)
+- `read PATH` — read file contents
+- `taint PATH` — mark a file untrusted
+- `status` — check if worker process is tainted
+- `write PATH` — attempt to write test string to file
+- `exit` — quit
 
-## Run with Gemini
+### 3. Read-Only Scripted Demo
 
-Install the dependencies once:
+```bash
+python3 -m agent.main --demo
+```
+
+### 4. Live Gemini Agent Mode
+
+Set up your virtual environment and `.env`:
 
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install -r agent/requirements.txt
 ```
 
-Put your key and model in the project-root `.env` file:
-
+Put your key in `.env`:
 ```dotenv
 GEMINI_API_KEY=your_actual_api_key
 GEMINI_MODEL=gemini-flash-latest
 ```
 
-`.env` is ignored by Git. Then start the agent:
-
+Then start the agent:
 ```bash
 .venv/bin/python -m agent.main
 ```
 
-Example instructions:
+Example prompts:
+- *"Read /report.txt and summarize it."*
+- *"Mark /inbox.txt as untrusted, then read it and tell me your taint status."*
+- *"Try to write to /clean.txt and tell me what happened."*
 
-```text
-List the files in xv6.
-Read /report.txt.
-Read /report.txt and summarize it.
-Read /missing.txt.
-```
+---
 
-The terminal displays the Gemini tool call, the actual xv6 result, and the final
-answer. Type `exit` to stop.
+## Automated Tests
 
-## Main files
-
-- `agent/main.py` — terminal input and Gemini function-calling loop.
-- `agent/bridge.py` — starts QEMU and exchanges serial messages with xv6.
-- `agent_worker.c` — persistent xv6 process that performs `LIST` and `READ`.
-- `report.txt` — sample content included in the guest filesystem.
-- `Makefile` — builds `agent_worker` and the separate `agent-fs.img`.
-
-The bridge uses temporary copies of `xv6.img` and `agent-fs.img`, so the original
-images stay unchanged and another QEMU window can remain open.
-
-## Small serial protocol
-
-```text
-Python → xv6:  READ /report.txt
-xv6 → Python: @XV6 DATA <hex-encoded bytes>
-xv6 → Python: @XV6 DONE OK
-```
-
-Hex encoding prevents file text from being confused with protocol messages.
-Requests run one at a time. Output is limited to 4096 bytes.
-
-## Tests
+Run the test suite:
 
 ```bash
-.venv/bin/python -m unittest agent.test_pipeline -v
+python3 -m unittest agent.test_pipeline -v
 ```
 
-The small test suite checks tool validation, the Gemini tool loop using mocked
-responses, and the real QEMU list/read/error round trip.
+This verifies:
+- Path and tool schema validation.
+- Tool loop error handling and state tracking.
+- The 5-step taint enforcement sequence.
+- Live QEMU round trip (when QEMU is present).
 
-For the presentation, show a successful summary and a missing-file error, then
-explain that the next stage adds taint tracking and kernel enforcement.
+In xv6 directly, all kernel test programs are compiled into the filesystem:
+- `taint_basic` — basic marking and idempotency
+- `taint_fork` — fork inheritance and zero-byte reads
+- `taint_exec` — `/safe/` prefix validation and taint survival across exec
+- `taint_probe` — verification helper for exec
+- `taint_pipe` — pipe propagation and clean/tainted shared writer races
+- `taint_policy` — write-down and unlink enforcement
+- `taint_launder` — `dup` and inode reuse attack defenses
